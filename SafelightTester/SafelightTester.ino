@@ -1,28 +1,23 @@
 /*!
- * SafelightTester — тестер безопасного света для Ч/Б печати (строгий режим)
+ * SafelightTester — тестер безопасного света для Ч/Б печати (в т.ч. лит)
  *
- * Единственный критерий: свет безопасен, если ЕГО ИЗЛУЧЕНИЕ ЦЕЛИКОМ >= 625 нм.
- * Любая обнаружимая энергия ниже 625 нм — провал.
+ * Критерий: в свете не должно быть синего/зелёного, а красный пик не должен
+ * уходить в оранжевый. Пороги и их калибровка — в verdict.h.
  *
  * Каналы AS7343 (18-канальный режим):
- *   Опасные (абс. порог, далеко от красного): F1 405, F2 425, FZ 450, F3 475, F4 515
- *   Опасные (отн. порог — хвосты фильтров):  F5 550, FY 555, FXL 600
- *   Безопасные (>= 625 нм):                   F6 640, F7 690, F8 745, NIR 855
+ *   Узкие сине-зелёные: F1 405, F2 425, FZ 450, F3 475, F4 515, F5 550
+ *     -> порог = доля от F6 (утечка фильтров от красного), но не ниже шума;
+ *        превышение = ОПАСНО.
+ *   Широкие: FY 555, FXL 600 — захватывают плечо красного пика
+ *     -> по отношению к F6: ПОГРАНИЧНО (пик ~605–620 нм) или ОПАСНО (оранжевый).
+ *   Красные: F6 640, F7 690, F8 745, NIR 855 — в вердикте не участвуют.
  *
- * Логика вердикта:
- *   - класс A: значение после вычитания темнового уровня должно быть
- *     в пределах шума (абсолютный порог);
- *   - класс B: допускается только "хвост" от красного света — не более
- *     REL_F5_FY от канала F6 (640 нм); FXL — не более REL_FXL от F6,
- *     иначе свет центрирован ниже 625 нм.
- *
- * Режим "максимально строгий": автоэкспозиция подбирает максимальную
- * чувствительность без пересвета; команда 'l' — прогон на максимальной
- * чувствительности (5 замеров), где виден даже слабый сине-зелёный отсвет.
+ * Вердикты: БЕЗОПАСНО / ПОГРАНИЧНО / ОПАСНО / свет не обнаружен / пересвет.
+ * Спектр — не доза: время безопасной работы решает только бумажный тест.
  *
  * Аппаратура: Arduino Uno + AS7343 (I2C 0x39)
  *   VIN->5V, GND->GND, SDA->A4, SCL->A5
- *   опционально: зелёный светодиод на D8 (PASS), красный на D9 (FAIL)
+ *   LCD 16x2: RS=6, EN=7, DB4..DB7=8..11; кнопка на D2 (на GND)
  *
  * Команды по Serial (115200):
  *   d — записать темновой уровень (СВЕТ ВЫКЛЮЧЕН)
@@ -37,6 +32,8 @@
 #include <EEPROM.h>
 
 #include <LiquidCrystal.h>
+
+#include "verdict.h"
 
 // LCD pins
 constexpr uint8_t PIN_RS = 6;
@@ -64,14 +61,12 @@ UiState uiState = UI_TURN_OFF_LIGHTS;
 unsigned long lastBtnPress = 0;
 const unsigned long DEBOUNCE_MS = 200;
 
-uint8_t lastVerdict = 2; // 0=PASS, 1=FAIL, 2=no light, 3=not measured
-uint16_t lastDomWl = 0;  // доминирующая длина волны
+uint8_t lastVerdict = VERDICT_NOT_MEASURED; // VERDICT_* из verdict.h
+uint8_t lastWorst = V_N;  // канал, определивший вердикт
+uint16_t lastFxlF6 = 0;   // FXL/F6 x100 — где сидит красный пик
 
-// ---- Пороги (тут настраивается строгость) ----
+// ---- Служебные пороги (пороги вердикта — в verdict.h) ----
 static const uint16_t SAT_LEVEL = 64000; // порог пересвета канала
-static const int ABS_FLOOR = 25;         // абсолютный порог шума после вычитания темнового, counts
-static const float REL_F5_FY = 0.08f;    // F5/FY не выше 8% от F6 (хвост красного)
-static const float REL_FXL = 1.5f;       // FXL не выше 150% от F6 (иначе свет <= 620 нм)
 static const uint16_t DARK_MAX = 2000;   // проверка: темновой замер не должен быть "светлым"
 
 // ---- Каналы в порядке длин волн ----
@@ -79,25 +74,22 @@ struct ChanInfo {
   const char *name;
   uint16_t wl;  // нм
   uint8_t idx;  // индекс в 18-канальном буфере
-  bool clsA;    // абсолютный порог
-  bool clsB;    // относительный порог
 };
 
 static const ChanInfo CH[12] = {
-  {"F1 ", 405, AS7343_CHANNEL_F1,  true,  false},
-  {"F2 ", 425, AS7343_CHANNEL_F2,  true,  false},
-  {"FZ ", 450, AS7343_CHANNEL_FZ,  true,  false},
-  {"F3 ", 475, AS7343_CHANNEL_F3,  true,  false},
-  {"F4 ", 515, AS7343_CHANNEL_F4,  true,  false},
-  {"F5 ", 550, AS7343_CHANNEL_F5,  false, true},
-  {"FY ", 555, AS7343_CHANNEL_FY,  false, true},
-  {"FXL", 600, AS7343_CHANNEL_FXL, false, true},
-  {"F6 ", 640, AS7343_CHANNEL_F6,  false, false},
-  {"F7 ", 690, AS7343_CHANNEL_F7,  false, false},
-  {"F8 ", 745, AS7343_CHANNEL_F8,  false, false},
-  {"NIR", 855, AS7343_CHANNEL_NIR, false, false},
+  {"F1 ", 405, AS7343_CHANNEL_F1},
+  {"F2 ", 425, AS7343_CHANNEL_F2},
+  {"FZ ", 450, AS7343_CHANNEL_FZ},
+  {"F3 ", 475, AS7343_CHANNEL_F3},
+  {"F4 ", 515, AS7343_CHANNEL_F4},
+  {"F5 ", 550, AS7343_CHANNEL_F5},
+  {"FY ", 555, AS7343_CHANNEL_FY},
+  {"FXL", 600, AS7343_CHANNEL_FXL},
+  {"F6 ", 640, AS7343_CHANNEL_F6},
+  {"F7 ", 690, AS7343_CHANNEL_F7},
+  {"F8 ", 745, AS7343_CHANNEL_F8},
+  {"NIR", 855, AS7343_CHANNEL_NIR},
 };
-enum { C_F4 = 4, C_F5 = 5, C_FY = 6, C_FXL = 7, C_F6 = 8, C_F7 = 9, C_F8 = 10 };
 
 // ---- Кандидаты автоэкспозиции: (ATIME, усиление), от максимума вниз ----
 struct Exposure { uint8_t atime; as7343_gain_t gain; };
@@ -225,26 +217,35 @@ static void captureDark() {
   Serial.println(F("x), сохранён в EEPROM."));
 }
 
-static void printTable(const int32_t *sig, const int32_t *th, const int32_t *raw) {
+static void printTable(const int32_t *sig, const VerdictOut &o, const int32_t *raw) {
   Serial.println(F("  канал  нм   raw     сигнал   порог  стат."));
   for (uint8_t i = 0; i < 12; i++) {
     char stat[8] = "   ";
-    if (CH[i].clsA || CH[i].clsB) stat[0] = (sig[i] > th[i]) ? '!' : 'o';
+    if (o.level[i] == LVL_OK) stat[0] = 'o';
+    else if (o.level[i] == LVL_BORDER) stat[0] = '?';
+    else if (o.level[i] == LVL_UNSAFE) stat[0] = '!';
     char buf[64];
     snprintf(buf, sizeof(buf), "  %s %4u %6ld %8ld %6ld  [%s]",
-             CH[i].name, CH[i].wl, (long)raw[CH[i].idx], (long)sig[i], (long)th[i], stat);
+             CH[i].name, CH[i].wl, (long)raw[i], (long)sig[i], (long)o.th[i], stat);
     Serial.println(buf);
   }
 }
 
-// ВЕРДИКТ: 0=PASS, 1=FAIL, 2=нет света
+static void printWorst(uint8_t w) {
+  Serial.print(F(" (канал "));
+  Serial.print(CH[w].name);
+  Serial.print(F(" "));
+  Serial.print(CH[w].wl);
+  Serial.println(F(" нм)."));
+}
 
 // Один тест: измерение + анализ + отчёт. avgReads>1 — усреднение по нескольким
 // замерам (длинный режим 'l').
 static void runTest(uint8_t avgReads) {
+  lastWorst = V_N;
   if (!darkValid) {
     Serial.println(F("НЕТ ТЕМНОВОГО УРОВНЯ: выключите свет и нажмите 'd'."));
-    lastVerdict = 3;
+    lastVerdict = VERDICT_NOT_MEASURED;
     return;
   }
 
@@ -271,89 +272,70 @@ static void runTest(uint8_t avgReads) {
   Serial.println(F(" мс"));
 
   float k = expFactor(e, darkExp);
-  int32_t sig[12], th[12];
-  int32_t f6 = 0;
+  int32_t sig[12], d[12];
   for (uint8_t i = 0; i < 12; i++) {
-    int32_t d = (int32_t)((float)dark[i] * k);
-    sig[i] = ch[i] - d;
+    d[i] = (int32_t)((float)dark[i] * k);
+    sig[i] = ch[i] - d[i];
     if (sig[i] < 0) sig[i] = 0;
-    th[i] = 3 * ABS_FLOOR + 3 * d;
-  }
-  f6 = sig[C_F6];
-  for (uint8_t i = 0; i < 12; i++) {
-    if (CH[i].clsB) {
-      int32_t rel = (CH[i].name[0] == 'F' && CH[i].wl <= 555)
-                        ? (int32_t)((float)f6 * REL_F5_FY)
-                        : (int32_t)((float)f6 * REL_FXL);
-      if (rel > th[i]) th[i] = rel;
-    }
   }
 
-  printTable(sig, th, ch);
+  VerdictOut o;
+  evaluateVerdict(sig, d, o);
+  printTable(sig, o, ch);
 
-  // доминирующая длина волны (без NIR — он всегда высокий)
-  uint8_t dom = 0;
-  for (uint8_t i = 1; i < 11; i++)
-    if (sig[i] > sig[dom]) dom = i;
-  Serial.print(F("Доминирующая полоса: "));
-  Serial.print(CH[dom].name);
-  Serial.print(F(" ("));
-  Serial.print(CH[dom].wl);
-  Serial.println(F(" нм)"));
-
-  // отношения каналов — для оценки «хвоста» ниже 625 нм
-  if (f6 > 0) {
-    Serial.print(F("Отношения: FXL/F6="));
-    Serial.print((float)sig[C_FXL] / f6, 2);
-    Serial.print(F(", FY/F6="));
-    Serial.print((float)sig[C_FY] / f6, 2);
-    Serial.print(F(", F5/F6="));
-    Serial.println((float)sig[C_F5] / f6, 3);
-    long redBand = sig[C_F6] + sig[C_F7] + sig[C_F8];
-    long below = sig[C_FXL] + sig[C_FY] + sig[C_F5];
-    if (redBand + below > 0) {
-      Serial.print(F("Доля света ниже 625 нм (оценка): "));
-      Serial.print(100.0f * below / (redBand + below), 1);
-      Serial.println(F("%"));
-    }
+  // где сидит красный пик: у честного красного ~620–630 нм FXL/F6 ~0.9
+  const int32_t f6 = sig[V_F6];
+  lastFxlF6 = 0;
+  if (f6 > 0 && !noLight) {
+    lastFxlF6 = (uint16_t)(100.0f * sig[V_FXL] / f6 + 0.5f);
+    Serial.print(F("Отношения к F6: FXL="));
+    Serial.print((float)sig[V_FXL] / f6, 2);
+    Serial.print(F(" (порог "));
+    Serial.print(FXL_BORDER, 2);
+    Serial.print(F("), FY="));
+    Serial.print((float)sig[V_FY] / f6, 2);
+    Serial.print(F(" (порог "));
+    Serial.print(FY_BORDER, 2);
+    Serial.print(F("), F5="));
+    Serial.print((float)sig[V_F5] / f6, 3);
+    Serial.print(F(" (порог "));
+    Serial.print(LEAK_LIMIT[V_F5], 3);
+    Serial.println(F(")"));
   }
 
   if (noLight) {
     Serial.println(F("ВЕРДИКТ: СВЕТА НЕ ОБНАРУЖЕНО (сенсор накрыт или свет выключен)"));
-    lastVerdict = 2;
+    lastVerdict = VERDICT_NO_LIGHT;
     return;
   }
-  if (overSat) {
-    Serial.println(F("ПРЕДУПРЕЖДЕНИЕ: пересвет даже на минимальной экспозиции, "));
-    Serial.println(F("  отнесите сенсор дальше от источника."));
-  }
-  if (sig[C_F6] >= 65500) {
-    Serial.println(F("ПРЕДУПРЕЖДЕНИЕ: F6 (640 нм) пересвет — относительные пороги завышены."));
-  }
-
-  bool fail = false;
-  uint8_t bad = 0;
-  for (uint8_t i = 0; i < 12; i++) {
-    if (!CH[i].clsA && !CH[i].clsB) continue;
-    if (sig[i] > th[i]) { fail = true; bad = i; }
-  }
-
-  if (!fail) {
-    Serial.println(F("ВЕРДИКТ: БЕЗОПАСНО [строгий режим] — излучение >= 625 нм,"));
-    Serial.println(F("  сине-зелёного света ниже порога не обнаружено."));
-    lastVerdict = 0;
-    lastDomWl = CH[dom].wl;
+  // При пересвете F6 занижен, а пороги, привязанные к нему, — тоже:
+  // вердикт ненадёжен, БЕЗОПАСНО не выдаём.
+  if (overSat || f6 >= SAT_LEVEL) {
+    Serial.println(F("ВЕРДИКТ: ПЕРЕСВЕТ — даже на минимальной экспозиции."));
+    Serial.println(F("  Отнесите сенсор дальше от источника и повторите."));
+    lastVerdict = VERDICT_TOO_BRIGHT;
     return;
   }
 
-  Serial.print(F("ВЕРДИКТ: ОПАСНО — обнаружен свет ниже 625 нм (канал "));
-  Serial.print(CH[bad].name);
-  Serial.print(F(" "));
-  Serial.print(CH[bad].wl);
-  Serial.println(F(" нм)."));
-  Serial.println(F("  Такой свет засвечивает Ч/Б бумагу. Устраните утечку или смените фильтр."));
-  lastVerdict = 1;
-  lastDomWl = CH[dom].wl;
+  lastVerdict = o.verdict;
+  lastWorst = o.worst;
+  switch (o.verdict) {
+    case VERDICT_SAFE:
+      Serial.println(F("ВЕРДИКТ: БЕЗОПАСНО — синего/зелёного не обнаружено,"));
+      Serial.println(F("  красный пик не сдвинут в оранжевый."));
+      Serial.println(F("  Допустимое время под светом — только по бумажному тесту."));
+      break;
+    case VERDICT_BORDERLINE:
+      Serial.print(F("ВЕРДИКТ: ПОГРАНИЧНО — пик сдвинут к оранжевому"));
+      printWorst(o.worst);
+      Serial.println(F("  Для лита и долгой работы — проверить бумажным тестом, снизить яркость."));
+      break;
+    default:
+      Serial.print(F("ВЕРДИКТ: ОПАСНО — обнаружен синий/зелёный/оранжевый свет"));
+      printWorst(o.worst);
+      Serial.println(F("  Такой свет засвечивает Ч/Б бумагу. Устраните утечку или смените фильтр."));
+      break;
+  }
 }
 
 static void runLongTest() {
@@ -376,7 +358,7 @@ void setup() {
   delay(500);
 
   Serial.println(F("=== SafelightTester: тестер безопасного света (Ч/Б печать) ==="));
-  Serial.println(F("Единственный критерий: весь свет >= 625 нм."));
+  Serial.println(F("Критерий: без синего/зелёного, красный пик не в оранжевом."));
   Serial.println(F("Подключение: VIN=5V, GND=GND, SDA=A4, SCL=A5"));
 
   if (!as7343.begin()) {
@@ -459,9 +441,8 @@ static void handleUiButton() {
   switch (uiState) {
     case UI_TURN_OFF_LIGHTS:
     case UI_WAIT_BUTTON_DARK:
-      if (!darkValid) {
-        captureDark();
-      }
+      // всегда свежий темновой: сохранённый в EEPROM мог устареть
+      captureDark();
       uiState = UI_TURN_ON_SAFELIGHT;
       lcd.clear();
       lcd.print("Turn on");
@@ -486,27 +467,51 @@ static void handleUiButton() {
   }
 }
 
+// Строка "FY  555": канал, определивший вердикт
+static void lcdPrintWorst() {
+  if (lastWorst >= V_N) return;
+  lcd.print(' ');
+  lcd.print(CH[lastWorst].name);
+  lcd.print(' ');
+  lcd.print(CH[lastWorst].wl);
+}
+
+static void lcdPrintFxlF6() {
+  lcd.print("FXL/F6 ");
+  lcd.print(lastFxlF6 / 100.0f, 2);
+}
+
 static void showUiResult() {
   lcd.clear();
   switch (lastVerdict) {
-    case 0:
+    case VERDICT_SAFE:
       lcd.print("SAFE");
       lcd.setCursor(0, 1);
-      lcd.print(lastDomWl);
-      lcd.print("nm OK");
+      lcdPrintFxlF6();
       break;
-    case 1:
-      lcd.print("UNSAFE!");
+    case VERDICT_BORDERLINE:
+      lcd.print("BORDER");
+      lcdPrintWorst();
       lcd.setCursor(0, 1);
-      lcd.print(lastDomWl);
-      lcd.print("nm");
+      lcdPrintFxlF6();
       break;
-    case 2:
+    case VERDICT_UNSAFE:
+      lcd.print("UNSAFE!");
+      lcdPrintWorst();
+      lcd.setCursor(0, 1);
+      lcdPrintFxlF6();
+      break;
+    case VERDICT_NO_LIGHT:
       lcd.print("No light");
       lcd.setCursor(0, 1);
       lcd.print("detected");
       break;
-    case 3:
+    case VERDICT_TOO_BRIGHT:
+      lcd.print("Too bright");
+      lcd.setCursor(0, 1);
+      lcd.print("Move sensor away");
+      break;
+    case VERDICT_NOT_MEASURED:
       lcd.print("No dark level");
       lcd.setCursor(0, 1);
       lcd.print("Calibrate first");
